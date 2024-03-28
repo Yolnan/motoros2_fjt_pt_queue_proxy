@@ -94,18 +94,25 @@ class PointQueueProxy:
 
 
     def _queue_point(self, joint_names: list[str], pt: JointTrajectoryPoint):
+        self._logger.debug('queue point callback: entry')
         req = QueueTrajPoint.Request(joint_names=joint_names, point=pt)
-
-        # async call but wait until future is returned
-        future : Future = self._queue_pt_client.call_async(req)
-
-        event = Event()
-        future.add_done_callback(lambda f, e=event: done_callback(f, e))
-        event.wait()
-
-        response : QueueTrajPoint.Response = future.result()
         
-        result_code = response.result_code.value
+        while rclpy.ok():
+            # async call but wait until future is returned
+            future : Future = self._queue_pt_client.call_async(req)
+
+            event = Event()
+            future.add_done_callback(lambda f, e=event: done_callback(f, e))
+            event.wait()
+
+            response : QueueTrajPoint.Response = future.result()
+            
+            result_code = response.result_code.value
+            
+            if result_code is not QueueResultEnum.BUSY:
+                break
+
+        self._logger.debug('queue point callback: exit')
 
         return result_code
 

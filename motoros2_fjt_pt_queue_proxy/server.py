@@ -28,6 +28,7 @@ from sensor_msgs.msg import JointState
 
 from simple_actions import SimpleActionServer
 
+BUSY_WAIT_TIME_PARAM = "busy_wait_time"
 CONVERGENCE_THRESHOLD_PARAM = "convergence_threshold"
 
 
@@ -49,6 +50,13 @@ class PointQueueProxy:
 
         # Declare ROS parameters
         self._node.declare_parameter(CONVERGENCE_THRESHOLD_PARAM, 0.01)
+        self._node.declare_parameter(BUSY_WAIT_TIME_PARAM, 0.05)
+
+        # seconds: how long to wait between (re)submissions
+        try:
+            self._busy_wait_time = float(self._node.get_parameter(BUSY_WAIT_TIME_PARAM).value)
+        except:
+            self._logger.error(f"Failed to load {BUSY_WAIT_TIME_PARAM} parameter")
 
         # radians: total joint distance, not per-joint
         try:
@@ -109,7 +117,9 @@ class PointQueueProxy:
             
             result_code = response.result_code.value
             
-            if result_code is not QueueResultEnum.BUSY:
+            if result_code is QueueResultEnum.BUSY:
+                time.sleep(self._busy_wait_time)
+            else:
                 break
 
         self._logger.debug('queue point callback: exit')

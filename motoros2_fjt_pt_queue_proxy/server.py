@@ -9,6 +9,12 @@ import math
 
 import rclpy
 
+from rclpy.node import Node
+from rclpy.task import Future
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.qos import QoSPresetProfiles
+from threading import Event
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from motoros2_interfaces.msg import QueueResultEnum
@@ -22,21 +28,34 @@ from sensor_msgs.msg import JointState
 
 from simple_actions import SimpleActionServer
 
+CONVERGENCE_THRESHOLD_PARAM = "convergence_threshold"
+
+
+def done_callback(_future: Future,
+                  event: Event):
+    """
+    done callback to unblock thread
+    """
+    event.set()
+    # seems to work when immediately cleared
+    event.clear()
+
 
 class PointQueueProxy:
     def __init__(self, node):
-        self._node = node
+        self._node : Node = node
         self._logger = self._node.get_logger()
         self._logger.info("PointQueueProxy: initialising ..")
 
-        # TODO: convert to ROS parameters
+        # Declare ROS parameters
+        self._node.declare_parameter(CONVERGENCE_THRESHOLD_PARAM, 0.01)
 
-        # maximum nr of retries per traj pt
-        self._max_retries: int = 20
-        # seconds: how long to wait between (re)submissions
-        self._busy_wait_time: float = 0.05
         # radians: total joint distance, not per-joint
-        self._convergence_threshold: float = 0.01
+        try:
+            self._convergence_threshold = float(self._node.get_parameter(CONVERGENCE_THRESHOLD_PARAM).value)
+        except:
+            self._logger.error(f"Failed to load {CONVERGENCE_THRESHOLD_PARAM} parameter")
+
 
         # TODO: use remapping, not parameters
         self._joint_states_topic: str = 'joint_states'
@@ -46,7 +65,7 @@ class PointQueueProxy:
 
         # first the service client, as there's no point in continuing if the
         # server is not available
-        self._cbg_svc = rclpy.callback_groups.MutuallyExclusiveCallbackGroup()
+        self._cbg_svc = MutuallyExclusiveCallbackGroup()
         self._queue_pt_client = self._node.create_client(
             QueueTrajPoint, self._queue_pt_srv, callback_group=self._cbg_svc)
         while not self._queue_pt_client.wait_for_service(timeout_sec=5.0):
@@ -65,8 +84,8 @@ class PointQueueProxy:
         # Use 'sensor_data' here, as it should be compatible with both
         self._sub_js = self._node.create_subscription(
             JointState, self._joint_states_topic, self._js_callback,
-            qos_profile=rclpy.qos.QoSPresetProfiles.get_from_short_key('sensor_data'),
-            callback_group=rclpy.callback_groups.MutuallyExclusiveCallbackGroup())
+            qos_profile=QoSPresetProfiles.get_from_short_key('sensor_data'),
+            callback_group=MutuallyExclusiveCallbackGroup())
 
         # stores last message we received from controller
         self._latest_jstates: JointState = None
@@ -74,48 +93,24 @@ class PointQueueProxy:
         self._logger.info("PointQueueProxy: initialisation complete")
 
 
-    def _queue_point(self, joint_names: list[str], pt: JointTrajectoryPoint, max_retries: int = 0):
-        self._logger.debug(f"attempting to queue pt (max_retries: {max_retries})")
-
-        attempts: int = 0
-        result_code: int = -1
+    def _queue_point(self, joint_names: list[str], pt: JointTrajectoryPoint):
         req = QueueTrajPoint.Request(joint_names=joint_names, point=pt)
 
-        # TODO: ugly ternary
-        while rclpy.ok() and ((attempts < max_retries) if max_retries else True):
-            self._logger.debug(f"queuing pt (attempt: {attempts})")
+        # async call but wait until future is returned
+        future : Future = self._queue_pt_client.call_async(req)
 
-            # use a sync request to keep control flow 'simple'.
-            # This should work as we use different cb grps and an mt executor.
-            # TODO: the synchronous call does not support setting a timeout,
-            # so if the server dies/disappears, this hangs forever
-            response = self._queue_pt_client.call(req)
+        event = Event()
+        future.add_done_callback(lambda f, e=event: done_callback(f, e))
+        event.wait()
 
-            # only if we receive a BUSY response we try again. Anything else
-            # is something only the caller can handle (including OK)
-            result_code = response.result_code.value
-            if result_code == QueueResultEnum.BUSY:
-                self._logger.debug(
-                    f"Busy (attempt: {attempts}). Trying again later.", throttle_duration_sec=1.0)
-                attempts += 1
-                time.sleep(self._busy_wait_time)
-                continue
+        response : QueueTrajPoint.Response = future.result()
+        
+        result_code = response.result_code.value
 
-            if result_code == QueueResultEnum.SUCCESS:
-                self._logger.debug(
-                    f"queue server accepted point: '{response.message}' ({result_code})")
-                break
-
-            # anything else is an error, so report
-            self._logger.warning(
-                f"queue server returned error: '{response.message}' ({result_code})")
-            break
-
-        # either -1, or one of the values from QueueResultEnum
         return result_code
 
 
-    def _js_callback(self, msg):
+    def _js_callback(self, msg: JointState):
         # TODO: add locking (if needed)
         self._latest_jstates = msg
 
@@ -145,7 +140,7 @@ class PointQueueProxy:
         return math.fsum([abs(val - d1[name]) for name, val in d0.items()])
 
 
-    def fjt_goal_callback(self, goal):
+    def fjt_goal_callback(self, goal : FollowJointTrajectory.Goal):
         self._logger.debug('fjt callback: entry')
 
         traj = goal.trajectory
@@ -203,7 +198,7 @@ class PointQueueProxy:
 
             pt = points[points_sent]
             result = self._queue_point(
-                joint_names=traj.joint_names, pt=pt, max_retries=self._max_retries)
+                joint_names=traj.joint_names, pt=pt)
 
             # if this is an error, or still BUSY, something is wrong. Abort
             # the goal and report error
@@ -275,10 +270,10 @@ class PointQueueProxy:
 
 def main():
     rclpy.init(args=sys.argv)
-    node = rclpy.node.Node('motoros2_fjt_pt_queue_proxy')
+    node = Node('motoros2_fjt_pt_queue_proxy')
     server = PointQueueProxy(node)
 
-    executor = rclpy.executors.MultiThreadedExecutor()
+    executor = MultiThreadedExecutor()
     executor.add_node(node)
     executor.spin()
 
